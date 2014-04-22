@@ -104,11 +104,14 @@ static inline void PBKDF2_SHA256_80_128(const uint32_t *tstate,
 static inline void PBKDF2_SHA256_128_32(uint32_t *tstate, uint32_t *ostate,
 	const uint32_t *salt, uint32_t *output)
 {
+	const int R=8;
 	uint32_t buf[16];
 	int i;
-	
-	sha256_transform(tstate, salt, 1);
-	sha256_transform(tstate, salt + 16, 1);
+	//32 ints * R * p (1)
+	for(int i=0;i<32*R;i+=16)
+	{
+		sha256_transform(tstate, salt+i, 1);
+	}
 	sha256_transform(tstate, finalblk, 0);
 	memcpy(buf, tstate, 32);
 	memcpy(buf + 8, outerpad, 32);
@@ -190,20 +193,21 @@ static inline void xor_salsa8(uint32_t B[16], const uint32_t Bx[16])
 
 static inline void scrypt_core(uint32_t *X, uint32_t *V)
 {
-	const int N=123;
+	const int N=256;
+	const int R=8;
 	uint32_t i, j, k;
 	
 	for (i = 0; i < N; i++) {
-		memcpy(&V[i * 32], X, 128);
-		xor_salsa8(&X[0], &X[16]);
-		xor_salsa8(&X[16], &X[0]);
+		memcpy(&V[i * (32*R)], X, 128*R);
+		xor_salsa8(&X[0], &X[16*R]);
+		xor_salsa8(&X[16*R], &X[0]);
 	}
 	for (i = 0; i < N; i++) {
-		j = 32 * (X[16] % N);
-		for (k = 0; k < 32; k++)
+		j = 32 * (X[16] & (N-1));
+		for (k = 0; k < 32*R; k++)
 			X[k] ^= V[j + k];
-		xor_salsa8(&X[0], &X[16]);
-		xor_salsa8(&X[16], &X[0]);
+		xor_salsa8(&X[0], &X[16*R]);
+		xor_salsa8(&X[16*R], &X[0]);
 	}
 }
 
@@ -211,7 +215,7 @@ static inline void scrypt_core(uint32_t *X, uint32_t *V)
 #define SCRYPT_MAX_WAYS 1
 #define scrypt_best_throughput() 1
 
-#define SCRYPT_BUFFER_SIZE (SCRYPT_MAX_WAYS * 131072 + 63)
+#define SCRYPT_BUFFER_SIZE (SCRYPT_MAX_WAYS * (128*8*256) + 63) //128*R*N
 
 unsigned char *scrypt_buffer_alloc()
 {
@@ -221,8 +225,9 @@ unsigned char *scrypt_buffer_alloc()
 static void scrypt_1024_1_1_256(const uint32_t *input, uint32_t *output,
 	uint32_t *midstate, unsigned char *scratchpad)
 {
+	const int R=8;
 	uint32_t tstate[8], ostate[8];
-	uint32_t X[32];
+	uint32_t X[32*R];
 	uint32_t *V;
 	
 	V = (uint32_t *)(((uintptr_t)(scratchpad) + 63) & ~ (uintptr_t)(63));
