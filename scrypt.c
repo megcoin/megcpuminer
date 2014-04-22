@@ -33,7 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
-
+#include <openssl/sha.h>
 static const uint32_t keypad[12] = {
 	0x80000000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00000280
 };
@@ -46,81 +46,161 @@ static const uint32_t outerpad[8] = {
 static const uint32_t finalblk[16] = {
 	0x00000001, 0x80000000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00000620
 };
-
-static inline void HMAC_SHA256_80_init(const uint32_t *key,
-	uint32_t *tstate, uint32_t *ostate)
+static inline uint32_t le32dec_v(const void *pp)
 {
-	uint32_t ihash[8];
-	uint32_t pad[16];
-	int i;
-
-	/* tstate is assumed to contain the midstate of key */
-	memcpy(pad, key + 16, 16);
-	memcpy(pad + 4, keypad, 48);
-	sha256_transform(tstate, pad, 0);
-	memcpy(ihash, tstate, 32);
-
-	sha256_init(ostate);
-	for (i = 0; i < 8; i++)
-		pad[i] = ihash[i] ^ 0x5c5c5c5c;
-	for (; i < 16; i++)
-		pad[i] = 0x5c5c5c5c;
-	sha256_transform(ostate, pad, 0);
-
-	sha256_init(tstate);
-	for (i = 0; i < 8; i++)
-		pad[i] = ihash[i] ^ 0x36363636;
-	for (; i < 16; i++)
-		pad[i] = 0x36363636;
-	sha256_transform(tstate, pad, 0);
+        const uint8_t *p = (uint8_t const *)pp;
+        return ((uint32_t)(p[0]) + ((uint32_t)(p[1]) << 8) +
+            ((uint32_t)(p[2]) << 16) + ((uint32_t)(p[3]) << 24));
 }
 
-static inline void PBKDF2_SHA256_80_128(const uint32_t *tstate,
-	const uint32_t *ostate, const uint32_t *salt, uint32_t *output)
+static inline void le32enc_vi(void *pp, uint32_t x)
 {
-	uint32_t istate[8], ostate2[8];
-	uint32_t ibuf[16], obuf[16];
-	int i, j;
+        uint8_t *p = (uint8_t *)pp;
+        p[0] = x & 0xff;
+        p[1] = (x >> 8) & 0xff;
+        p[2] = (x >> 16) & 0xff;
+        p[3] = (x >> 24) & 0xff;
+}
+static inline uint32_t be32dec_v(const void *pp)
+{
+	const uint8_t *p = (uint8_t const *)pp;
+	return ((uint32_t)(p[3]) + ((uint32_t)(p[2]) << 8) +
+	    ((uint32_t)(p[1]) << 16) + ((uint32_t)(p[0]) << 24));
+}
 
-	memcpy(istate, tstate, 32);
-	sha256_transform(istate, salt, 0);
-	
-	memcpy(ibuf, salt + 16, 16);
-	memcpy(ibuf + 5, innerpad, 44);
-	memcpy(obuf + 8, outerpad, 32);
+static inline void be32enc_vi(void *pp, uint32_t x)
+{
+	uint8_t *p = (uint8_t *)pp;
+	p[3] = x & 0xff;
+	p[2] = (x >> 8) & 0xff;
+	p[1] = (x >> 16) & 0xff;
+	p[0] = (x >> 24) & 0xff;
+}
 
-	for (i = 0; i < 4; i++) {
-		memcpy(obuf, istate, 32);
-		ibuf[4] = i + 1;
-		sha256_transform(obuf, ibuf, 0);
+typedef struct HMAC_SHA256Context {
+	SHA256_CTX ictx;
+	SHA256_CTX octx;
+} HMAC_SHA256_CTX;
 
-		memcpy(ostate2, ostate, 32);
-		sha256_transform(ostate2, obuf, 0);
-		for (j = 0; j < 8; j++)
-			output[8 * i + j] = swab32(ostate2[j]);
+/* Initialize an HMAC-SHA256 operation with the given key. */
+static void
+HMAC_SHA256_Init(HMAC_SHA256_CTX *ctx, const void *_K, size_t Klen)
+{
+	unsigned char pad[64];
+	unsigned char khash[32];
+	const unsigned char *K = (const unsigned char *)_K;
+	size_t i;
+
+	/* If Klen > 64, the key is really SHA256(K). */
+	if (Klen > 64) {
+		SHA256_Init(&ctx->ictx);
+		SHA256_Update(&ctx->ictx, K, Klen);
+		SHA256_Final(khash, &ctx->ictx);
+		K = khash;
+		Klen = 32;
 	}
+
+	/* Inner SHA256 operation is SHA256(K xor [block of 0x36] || data). */
+	SHA256_Init(&ctx->ictx);
+	memset(pad, 0x36, 64);
+	for (i = 0; i < Klen; i++)
+		pad[i] ^= K[i];
+	SHA256_Update(&ctx->ictx, pad, 64);
+
+	/* Outer SHA256 operation is SHA256(K xor [block of 0x5c] || hash). */
+	SHA256_Init(&ctx->octx);
+	memset(pad, 0x5c, 64);
+	for (i = 0; i < Klen; i++)
+		pad[i] ^= K[i];
+	SHA256_Update(&ctx->octx, pad, 64);
+
+	/* Clean the stack. */
+	memset(khash, 0, 32);
 }
 
-static inline void PBKDF2_SHA256_128_32(uint32_t *tstate, uint32_t *ostate,
-	const uint32_t *salt, uint32_t *output)
+/* Add bytes to the HMAC-SHA256 operation. */
+static void
+HMAC_SHA256_Update(HMAC_SHA256_CTX *ctx, const void *in, size_t len)
 {
-	const int R=8;
-	uint32_t buf[16];
-	int i;
-	//32 ints * R * p (1)
-	for(int i=0;i<32*R;i+=16)
-	{
-		sha256_transform(tstate, salt+i, 1);
-	}
-	sha256_transform(tstate, finalblk, 0);
-	memcpy(buf, tstate, 32);
-	memcpy(buf + 8, outerpad, 32);
-
-	sha256_transform(ostate, buf, 0);
-	for (i = 0; i < 8; i++)
-		output[i] = swab32(ostate[i]);
+	/* Feed data to the inner SHA256 operation. */
+	SHA256_Update(&ctx->ictx, in, len);
 }
 
+/* Finish an HMAC-SHA256 operation. */
+static void
+HMAC_SHA256_Final(unsigned char digest[32], HMAC_SHA256_CTX *ctx)
+{
+	unsigned char ihash[32];
+
+	/* Finish the inner SHA256 operation. */
+	SHA256_Final(ihash, &ctx->ictx);
+
+	/* Feed the inner hash to the outer SHA256 operation. */
+	SHA256_Update(&ctx->octx, ihash, 32);
+
+	/* Finish the outer SHA256 operation. */
+	SHA256_Final(digest, &ctx->octx);
+
+	/* Clean the stack. */
+	memset(ihash, 0, 32);
+}
+
+/**
+ * PBKDF2_SHA256(passwd, passwdlen, salt, saltlen, c, buf, dkLen):
+ * Compute PBKDF2(passwd, salt, c, dkLen) using HMAC-SHA256 as the PRF, and
+ * write the output to buf.  The value dkLen must be at most 32 * (2^32 - 1).
+ */
+void
+PBKDF2_SHA256(const uint8_t *passwd, size_t passwdlen, const uint8_t *salt,
+    size_t saltlen, uint64_t c, uint8_t *buf, size_t dkLen)
+{
+	HMAC_SHA256_CTX PShctx, hctx;
+	size_t i;
+	uint8_t ivec[4];
+	uint8_t U[32];
+	uint8_t T[32];
+	uint64_t j;
+	int k;
+	size_t clen;
+
+	/* Compute HMAC state after processing P and S. */
+	HMAC_SHA256_Init(&PShctx, passwd, passwdlen);
+	HMAC_SHA256_Update(&PShctx, salt, saltlen);
+
+	/* Iterate through the blocks. */
+	for (i = 0; i * 32 < dkLen; i++) {
+		/* Generate INT(i + 1). */
+		be32enc_vi(ivec, (uint32_t)(i + 1));
+
+		/* Compute U_1 = PRF(P, S || INT(i)). */
+		memcpy(&hctx, &PShctx, sizeof(HMAC_SHA256_CTX));
+		HMAC_SHA256_Update(&hctx, ivec, 4);
+		HMAC_SHA256_Final(U, &hctx);
+
+		/* T_i = U_1 ... */
+		memcpy(T, U, 32);
+
+		for (j = 2; j <= c; j++) {
+			/* Compute U_j. */
+			HMAC_SHA256_Init(&hctx, passwd, passwdlen);
+			HMAC_SHA256_Update(&hctx, U, 32);
+			HMAC_SHA256_Final(U, &hctx);
+
+			/* ... xor U_j ... */
+			for (k = 0; k < 32; k++)
+				T[k] ^= U[k];
+		}
+
+		/* Copy as many bytes as necessary into buf. */
+		clen = dkLen - i * 32;
+		if (clen > 32)
+			clen = 32;
+		memcpy(&buf[i * 32], T, clen);
+	}
+
+	/* Clean PShctx, since we never called _Final on it. */
+	memset(&PShctx, 0, sizeof(HMAC_SHA256_CTX));
+}
 
 
 static inline void xor_salsa8(uint32_t B[16], const uint32_t Bx[16])
@@ -219,7 +299,7 @@ static inline void scrypt_core(uint32_t *X, uint32_t *V)
 
 unsigned char *scrypt_buffer_alloc()
 {
-	return malloc(SCRYPT_BUFFER_SIZE);
+	return (unsigned char*)malloc(SCRYPT_BUFFER_SIZE);
 }
 
 static void scrypt_1024_1_1_256(const uint32_t *input, uint32_t *output,
@@ -227,18 +307,22 @@ static void scrypt_1024_1_1_256(const uint32_t *input, uint32_t *output,
 {
 	const int R=8;
 	uint32_t tstate[8], ostate[8];
+	uint8_t B[128*R];
 	uint32_t X[32*R];
 	uint32_t *V;
 	
 	V = (uint32_t *)(((uintptr_t)(scratchpad) + 63) & ~ (uintptr_t)(63));
+	PBKDF2_SHA256((const uint8_t *)input, 80, (const uint8_t *)input, 80, 1, B, 128*R);
+	for (int k = 0; k < 32*R; k++)
+		X[k] = le32dec_v(&B[4 * k]);
 
-	memcpy(tstate, midstate, 32);
-	HMAC_SHA256_80_init(input, tstate, ostate);
-	PBKDF2_SHA256_80_128(tstate, ostate, input, X);
 
 	scrypt_core(X, V);
 
-	PBKDF2_SHA256_128_32(tstate, ostate, X, output);
+	for (int k = 0; k < 32*R; k++)
+		le32enc_vi(&B[4 * k], X[k]);
+
+	PBKDF2_SHA256((const uint8_t *)input, 80, B, 128*R, 1, (uint8_t *)output, 32);
 }
 
 
@@ -257,8 +341,8 @@ int scanhash_scrypt(int thr_id, uint32_t *pdata,
 	for (i = 0; i < throughput; i++)
 		memcpy(data + i * 20, pdata, 80);
 	
-	sha256_init(midstate);
-	sha256_transform(midstate, data, 0);
+	//sha256_init(midstate);
+	//sha256_transform(midstate, data, 0);
 	
 	do {
 		for (i = 0; i < throughput; i++)
