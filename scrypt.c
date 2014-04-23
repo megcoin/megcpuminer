@@ -26,7 +26,7 @@
  * This file was originally written by Colin Percival as part of the Tarsnap
  * online backup system.
  */
-
+extern "C"{
 #include "cpuminer-config.h"
 #include "miner.h"
 
@@ -535,7 +535,7 @@ int scanhash_scrypt(int thr_id, uint32_t *pdata,
 		for (i = 0; i < throughput; i++)
 			data[i * 20 + 19] = ++n;
 		
-		scrypt_1024_1_1_256(data, hash, scratchbuf);
+		scrypt_1024_1_1_256((char*)data, (char*)hash, (char*)scratchbuf);
 		
 		for (i = 0; i < throughput; i++) {
 			if (hash[i * 8 + 7] <= Htarg && fulltest(hash + i * 8, ptarget)) {
@@ -549,4 +549,5 @@ int scanhash_scrypt(int thr_id, uint32_t *pdata,
 	*hashes_done = n - pdata[19] + 1;
 	pdata[19] = n;
 	return 0;
+}
 }
