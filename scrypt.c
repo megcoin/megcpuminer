@@ -522,7 +522,8 @@ int scanhash_scrypt(int thr_id, uint32_t *pdata,
 	const uint32_t Htarg = ptarget[7];
 	int throughput = scrypt_best_throughput();
 	int i;
-	
+        for (i = 0; i < 80; i++)
+                ((unsigned char*)pdata)[i] = be32dec(((char*)pdata) + i);	
 	
 	for (i = 0; i < throughput; i++)
 		memcpy(data + i * 20, pdata, 80);
@@ -554,6 +555,7 @@ int scanhash_scrypt(int thr_id, uint32_t *pdata,
 		exit(1); */
 		for (i = 0; i < throughput; i++) {
 			if (hash[i * 8 + 7] <= Htarg && fulltest(hash + i*8, ptarget)) {
+
 				*hashes_done = n - pdata[19] + 1;
 				pdata[19] = data[i * 20 + 19];
 				return 1;
