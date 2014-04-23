@@ -394,23 +394,51 @@ smix(uint8_t * B, size_t r, uint64_t N, uint8_t * V, uint8_t * XY)
  * Return 0 on success; or -1 on error.
  */
 
-void scrypt_core(const char* input, char* output, char* scratchpad, uint32_t len)
+int
+crypto_scrypt(const uint8_t * passwd, size_t passwdlen,
+    const uint8_t * salt, size_t saltlen, uint64_t N, uint32_t _r, uint32_t _p,
+    uint8_t * buf, size_t buflen)
 {
 	uint8_t * B;
-	uint32_t * V;
-	uint32_t * XY;
+	uint8_t * V;
+	uint8_t * XY;
+	size_t r = _r, p = _p;
 	uint32_t i;
 
-	const uint32_t N = 1024;
-	const uint32_t r = 1;
-	const uint32_t p = 1;
+	/* Sanity-check parameters. */
+#if SIZE_MAX > UINT32_MAX
+	if (buflen > (((uint64_t)(1) << 32) - 1) * 32) {
+		//errno = EFBIG;
+		goto err0;
+	}
+#endif
+	if ((uint64_t)(r) * (uint64_t)(p) >= (1 << 30)) {
+		//errno = EFBIG;
+		goto err0;
+	}
+	if (((N & (N - 1)) != 0) || (N == 0)) {
+		//errno = EINVAL;
+		goto err0;
+	}
+	if ((r > SIZE_MAX / 128 / p) ||
+#if SIZE_MAX / 256 <= UINT32_MAX
+	    (r > SIZE_MAX / 256) ||
+#endif
+	    (N > SIZE_MAX / 128 / r)) {
+		//errno = ENOMEM;
+		goto err0;
+	}
 
-	B = (uint8_t *)(((uintptr_t)(scratchpad) + 63) & ~ (uintptr_t)(63));
-	XY = (uint32_t *)(B + (128 * r * p));
-	V = (uint32_t *)(B + (128 * r * p) + (256 * r + 64));
+	/* Allocate memory. */
+	if ((B = (uint8_t*)malloc(128 * r * p)) == NULL)
+		goto err0;
+	if ((XY = (uint8_t*)malloc(256 * r)) == NULL)
+		goto err1;
+	if ((V = (uint8_t*)malloc(128 * r * N)) == NULL)
+		goto err2;
 
 	/* 1: (B_0 ... B_{p-1}) <-- PBKDF2(P, S, 1, p * MFLen) */
-	PBKDF2_SHA256((const uint8_t*)input, len, (const uint8_t*)input, len, 1, B, p * 128 * r);
+	PBKDF2_SHA256(passwd, passwdlen, salt, saltlen, 1, B, p * 128 * r);
 
 	/* 2: for i = 0 to p - 1 do */
 	for (i = 0; i < p; i++) {
@@ -419,6 +447,58 @@ void scrypt_core(const char* input, char* output, char* scratchpad, uint32_t len
 	}
 
 	/* 5: DK <-- PBKDF2(P, B, 1, dkLen) */
+	PBKDF2_SHA256(passwd, passwdlen, B, p * 128 * r, 1, buf, buflen);
+
+	/* Free memory. */
+	free(V);
+	free(XY);
+	free(B);
+
+	/* Success! */
+	return (0);
+
+err2:
+	free(XY);
+err1:
+	free(B);
+err0:
+	/* Failure! */
+	return (-1);
+}
+
+void scrypt_1024_1_1_256(const char *input, char *output, char *scratchpad)
+{
+	const int N=256;
+	const int R=8;
+	const int P=1;
+	crypto_scrypt((uint8_t*)input, 80, (uint8_t*)input, 80, N, R, P, (uint8_t*)output, (256/8)); 
+}
+/*
+void scrypt_core(const char* input, char* output, char* scratchpad, uint32_t len)
+{
+	uint8_t * B;
+	uint8_t * V;
+	uint8_t * XY;
+	uint32_t i;
+
+	const uint32_t N = 1024;
+	const uint32_t r = 1;
+	const uint32_t p = 1;
+
+	B = (uint8_t *)(((uintptr_t)(scratchpad) + 63) & ~ (uintptr_t)(63));
+	XY = (uint8_t *)(B + (128 * r * p));
+	V = (uint8_t *)(B + (128 * r * p) + (256 * r + 64));
+
+	/* 1: (B_0 ... B_{p-1}) <-- PBKDF2(P, S, 1, p * MFLen) *
+	PBKDF2_SHA256((const uint8_t*)input, len, (const uint8_t*)input, len, 1, B, p * 128 * r);
+
+	/* 2: for i = 0 to p - 1 do *
+	for (i = 0; i < p; i++) {
+		/* 3: B_i <-- MF(B_i, N) *
+		smix(&B[i * 128 * r], r, N, V, XY);
+	}
+
+	/* 5: DK <-- PBKDF2(P, B, 1, dkLen) *
 	PBKDF2_SHA256((const uint8_t*)input, len, B, p * 128 * r, 1, (uint8_t*)output, 32);
 }
 
@@ -430,6 +510,7 @@ void scrypt_1024_1_1_256(const char *input, char *output, char *scratchpad)
 	const int P=1;
 	scrypt_core((uint8_t*)input, (uint8_t*)output, scratchpad, 80); 
 }
+*/
 #define SCRYPT_MAX_WAYS 1
 #define scrypt_best_throughput() 1
 
@@ -438,7 +519,6 @@ int scanhash_scrypt(int thr_id, uint32_t *pdata,
 	uint32_t max_nonce, unsigned long *hashes_done)
 {
 	uint32_t data[SCRYPT_MAX_WAYS * 20], hash[SCRYPT_MAX_WAYS * 8];
-	uint32_t midstate[8];
 	uint32_t n = pdata[19] - 1;
 	const uint32_t Htarg = ptarget[7];
 	int throughput = scrypt_best_throughput();
