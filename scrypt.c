@@ -467,8 +467,8 @@ err0:
 
 void scrypt_1024_1_1_256(const char *input, char *output, char *scratchpad)
 {
-	const int N=256;
-	const int R=8;
+	const int N=8;
+	const int R=4;
 	const int P=1;
 	crypto_scrypt((uint8_t*)input, 80, (uint8_t*)input, 80, N, R, P, (uint8_t*)output, (256/8)); 
 }
@@ -522,9 +522,9 @@ int scanhash_scrypt(int thr_id, uint32_t *pdata,
 	const uint32_t Htarg = ptarget[7];
 	int throughput = scrypt_best_throughput();
 	int i;
-        for (i = 0; i < 80; i++)
+        /*for (i = 0; i < 80; i++)
                 ((unsigned char*)pdata)[i] = be32dec(((char*)pdata) + i);	
-	
+	*/
 	for (i = 0; i < throughput; i++)
 		memcpy(data + i * 20, pdata, 80);
 	

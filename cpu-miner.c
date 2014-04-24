@@ -309,7 +309,7 @@ static bool work_decode(const json_t *val, struct work *work)
 	}
 
 	for (i = 0; i < ARRAY_SIZE(work->data); i++)
-		work->data[i] = le32dec(work->data + i);
+		work->data[i] = be32dec(work->data + i);
 	for (i = 0; i < ARRAY_SIZE(work->target); i++)
 		work->target[i] = le32dec(work->target + i);
 
@@ -380,9 +380,11 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 			goto out;
 		}
 	} else {
+		printf("xxx\n");
+		fgetc(stdin);
 		/* build hex string */
 		for (i = 0; i < ARRAY_SIZE(work->data); i++)
-			le32enc(work->data + i, work->data[i]);
+			be32enc(work->data + i, work->data[i]);
 		str = bin2hex((unsigned char *)work->data, sizeof(work->data));
 		if (unlikely(!str)) {
 			applog(LOG_ERR, "submit_upstream_work OOM");
