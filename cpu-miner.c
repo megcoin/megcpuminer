@@ -356,7 +356,7 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 	if (!submit_old && memcmp(work->data + 1, g_work.data + 1, 32)) {
 		if (opt_debug)
 			applog(LOG_DEBUG, "DEBUG: stale work detected, discarding");
-		return true;
+//		return true;
 	}
 
 	if (have_stratum) {
