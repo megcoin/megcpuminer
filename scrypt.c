@@ -33,6 +33,12 @@
 #include <string.h>
 #include <inttypes.h>
 #include <openssl/sha.h>
+
+#if defined(__i386__) || defined(__x86_64__)
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <emmintrin.h>
+#endif
 static const uint32_t keypad[12] = {
 	0x80000000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00000280
 };
@@ -218,29 +224,30 @@ unsigned char *scrypt_buffer_alloc()
 
 
 
-static void blkcpy(uint8_t *, uint8_t *, size_t);
-static void blkxor(uint8_t *, uint8_t *, size_t);
-static void salsa20_8(uint8_t[64]);
-static void blockmix_salsa8(uint8_t *, uint8_t *, size_t);
-static uint64_t integerify(uint8_t *, size_t);
-static void smix(uint8_t *, size_t, uint64_t, uint8_t *, uint8_t *);
+#if defined(__i386__) || defined(__x86_64__)
 
 static void
-blkcpy(uint8_t * dest, uint8_t * src, size_t len)
+blkcpy(void * dest, void * src, size_t len)
 {
+	__m128i * D = (__m128i*)dest;
+	__m128i * S = (__m128i*)src;
+	size_t L = len / 16;
 	size_t i;
 
-	for (i = 0; i < len; i++)
-		dest[i] = src[i];
+	for (i = 0; i < L; i++)
+		D[i] = S[i];
 }
 
 static void
-blkxor(uint8_t * dest, uint8_t * src, size_t len)
+blkxor(void * dest, void * src, size_t len)
 {
+	__m128i * D = (__m128i*)dest;
+	__m128i * S = (__m128i*)src;
+	size_t L = len / 16;
 	size_t i;
 
-	for (i = 0; i < len; i++)
-		dest[i] ^= src[i];
+	for (i = 0; i < L; i++)
+		D[i] = _mm_xor_si128(D[i], S[i]);
 }
 
 /**
@@ -248,19 +255,215 @@ blkxor(uint8_t * dest, uint8_t * src, size_t len)
  * Apply the salsa20/8 core to the provided block.
  */
 static void
-salsa20_8(uint8_t B[64])
+salsa20_8(__m128i B[4])
 {
-	uint32_t B32[16];
+	__m128i X0, X1, X2, X3;
+	__m128i T;
+	size_t i;
+
+	X0 = B[0];
+	X1 = B[1];
+	X2 = B[2];
+	X3 = B[3];
+
+	for (i = 0; i < 8; i += 2) {
+		/* Operate on "columns". */
+		T = _mm_add_epi32(X0, X3);
+		X1 = _mm_xor_si128(X1, _mm_slli_epi32(T, 7));
+		X1 = _mm_xor_si128(X1, _mm_srli_epi32(T, 25));
+		T = _mm_add_epi32(X1, X0);
+		X2 = _mm_xor_si128(X2, _mm_slli_epi32(T, 9));
+		X2 = _mm_xor_si128(X2, _mm_srli_epi32(T, 23));
+		T = _mm_add_epi32(X2, X1);
+		X3 = _mm_xor_si128(X3, _mm_slli_epi32(T, 13));
+		X3 = _mm_xor_si128(X3, _mm_srli_epi32(T, 19));
+		T = _mm_add_epi32(X3, X2);
+		X0 = _mm_xor_si128(X0, _mm_slli_epi32(T, 18));
+		X0 = _mm_xor_si128(X0, _mm_srli_epi32(T, 14));
+
+		/* Rearrange data. */
+		X1 = _mm_shuffle_epi32(X1, 0x93);
+		X2 = _mm_shuffle_epi32(X2, 0x4E);
+		X3 = _mm_shuffle_epi32(X3, 0x39);
+
+		/* Operate on "rows". */
+		T = _mm_add_epi32(X0, X1);
+		X3 = _mm_xor_si128(X3, _mm_slli_epi32(T, 7));
+		X3 = _mm_xor_si128(X3, _mm_srli_epi32(T, 25));
+		T = _mm_add_epi32(X3, X0);
+		X2 = _mm_xor_si128(X2, _mm_slli_epi32(T, 9));
+		X2 = _mm_xor_si128(X2, _mm_srli_epi32(T, 23));
+		T = _mm_add_epi32(X2, X3);
+		X1 = _mm_xor_si128(X1, _mm_slli_epi32(T, 13));
+		X1 = _mm_xor_si128(X1, _mm_srli_epi32(T, 19));
+		T = _mm_add_epi32(X1, X2);
+		X0 = _mm_xor_si128(X0, _mm_slli_epi32(T, 18));
+		X0 = _mm_xor_si128(X0, _mm_srli_epi32(T, 14));
+
+		/* Rearrange data. */
+		X1 = _mm_shuffle_epi32(X1, 0x39);
+		X2 = _mm_shuffle_epi32(X2, 0x4E);
+		X3 = _mm_shuffle_epi32(X3, 0x93);
+	}
+
+	B[0] = _mm_add_epi32(B[0], X0);
+	B[1] = _mm_add_epi32(B[1], X1);
+	B[2] = _mm_add_epi32(B[2], X2);
+	B[3] = _mm_add_epi32(B[3], X3);
+}
+
+/**
+ * blockmix_salsa8(Bin, Bout, X, r):
+ * Compute Bout = BlockMix_{salsa20/8, r}(Bin).  The input Bin must be 128r
+ * bytes in length; the output Bout must also be the same size.  The
+ * temporary space X must be 64 bytes.
+ */
+static void
+blockmix_salsa8(__m128i * Bin, __m128i * Bout, __m128i * X, size_t r)
+{
+	size_t i;
+
+	/* 1: X <-- B_{2r - 1} */
+	blkcpy(X, &Bin[8 * r - 4], 64);
+
+	/* 2: for i = 0 to 2r - 1 do */
+	for (i = 0; i < r; i++) {
+		/* 3: X <-- H(X \xor B_i) */
+		blkxor(X, &Bin[i * 8], 64);
+		salsa20_8(X);
+
+		/* 4: Y_i <-- X */
+		/* 6: B' <-- (Y_0, Y_2 ... Y_{2r-2}, Y_1, Y_3 ... Y_{2r-1}) */
+		blkcpy(&Bout[i * 4], X, 64);
+
+		/* 3: X <-- H(X \xor B_i) */
+		blkxor(X, &Bin[i * 8 + 4], 64);
+		salsa20_8(X);
+
+		/* 4: Y_i <-- X */
+		/* 6: B' <-- (Y_0, Y_2 ... Y_{2r-2}, Y_1, Y_3 ... Y_{2r-1}) */
+		blkcpy(&Bout[(r + i) * 4], X, 64);
+	}
+}
+
+/**
+ * integerify(B, r):
+ * Return the result of parsing B_{2r-1} as a little-endian integer.
+ */
+static uint64_t
+integerify(void * B, size_t r)
+{
+	uint32_t * X = (uint32_t *)((uintptr_t)(B) + (2 * r - 1) * 64);
+
+	return (((uint64_t)(X[13]) << 32) + X[0]);
+}
+
+/**
+ * smix(B, r, N, V, XY):
+ * Compute B = SMix_r(B, N).  The input B must be 128r bytes in length;
+ * the temporary storage V must be 128rN bytes in length; the temporary
+ * storage XY must be 256r + 64 bytes in length.  The value N must be a
+ * power of 2 greater than 1.  The arrays B, V, and XY must be aligned to a
+ * multiple of 64 bytes.
+ */
+static void
+smix(uint8_t * B, size_t r, uint64_t N, void * V, void * XY)
+{
+	__m128i * X = (__m128i*)XY;
+	__m128i * Y = (__m128i*)(void *)((uintptr_t)(XY) + 128 * r);
+	__m128i * Z = (__m128i*)(void *)((uintptr_t)(XY) + 256 * r);
+	uint32_t * X32 = (uint32_t *)X;
+	uint64_t i, j;
+	size_t k;
+
+	/* 1: X <-- B */
+	for (k = 0; k < 2 * r; k++) {
+		for (i = 0; i < 16; i++) {
+			X32[k * 16 + i] =
+			    le32dec(&B[(k * 16 + (i * 5 % 16)) * 4]);
+		}
+	}
+
+	/* 2: for i = 0 to N - 1 do */
+	for (i = 0; i < N; i += 2) {
+		/* 3: V_i <-- X */
+		blkcpy((void *)((uintptr_t)(V) + i * 128 * r), X, 128 * r);
+
+		/* 4: X <-- H(X) */
+		blockmix_salsa8(X, Y, Z, r);
+
+		/* 3: V_i <-- X */
+		blkcpy((void *)((uintptr_t)(V) + (i + 1) * 128 * r),
+		    Y, 128 * r);
+
+		/* 4: X <-- H(X) */
+		blockmix_salsa8(Y, X, Z, r);
+	}
+
+	/* 6: for i = 0 to N - 1 do */
+	for (i = 0; i < N; i += 2) {
+		/* 7: j <-- Integerify(X) mod N */
+		j = integerify(X, r) & (N - 1);
+
+		/* 8: X <-- H(X \xor V_j) */
+		blkxor(X, (void *)((uintptr_t)(V) + j * 128 * r), 128 * r);
+		blockmix_salsa8(X, Y, Z, r);
+
+		/* 7: j <-- Integerify(X) mod N */
+		j = integerify(Y, r) & (N - 1);
+
+		/* 8: X <-- H(X \xor V_j) */
+		blkxor(Y, (void *)((uintptr_t)(V) + j * 128 * r), 128 * r);
+		blockmix_salsa8(Y, X, Z, r);
+	}
+
+	/* 10: B' <-- X */
+	for (k = 0; k < 2 * r; k++) {
+		for (i = 0; i < 16; i++) {
+			le32enc(&B[(k * 16 + (i * 5 % 16)) * 4],
+			    X32[k * 16 + i]);
+		}
+	}
+}
+
+#else
+
+
+static void
+blkcpy(void * dest, void * src, size_t len)
+{
+	size_t * D = (size_t*)dest;
+	size_t * S = (size_t*)src;
+	size_t L = len / sizeof(size_t);
+	size_t i;
+
+	for (i = 0; i < L; i++)
+		D[i] = S[i];
+}
+
+static void
+blkxor(void * dest, void * src, size_t len)
+{
+	size_t * D = (size_t*)dest;
+	size_t * S = (size_t*)src;
+	size_t L = len / sizeof(size_t);
+	size_t i;
+
+	for (i = 0; i < L; i++)
+		D[i] ^= S[i];
+}
+
+/**
+ * salsa20_8(B):
+ * Apply the salsa20/8 core to the provided block.
+ */
+static void
+salsa20_8(uint32_t B[16])
+{
 	uint32_t x[16];
 	size_t i;
 
-	/* Convert little-endian values in. */
-	for (i = 0; i < 16; i++)
-		B32[i] = le32dec(&B[i * 4]);
-
-	/* Compute x = doubleround^4(B32). */
-	for (i = 0; i < 16; i++)
-		x[i] = B32[i];
+	blkcpy(x, B, 64);
 	for (i = 0; i < 8; i += 2) {
 #define R(a,b) (((a) << (b)) | ((a) >> (32 - (b))))
 		/* Operate on columns. */
@@ -290,45 +493,42 @@ salsa20_8(uint8_t B[64])
 		x[14] ^= R(x[13]+x[12],13);  x[15] ^= R(x[14]+x[13],18);
 #undef R
 	}
-
-	/* Compute B32 = B32 + x. */
 	for (i = 0; i < 16; i++)
-		B32[i] += x[i];
-
-	/* Convert little-endian values out. */
-	for (i = 0; i < 16; i++)
-		le32enc(&B[4 * i], B32[i]);
+		B[i] += x[i];
 }
 
 /**
- * blockmix_salsa8(B, Y, r):
- * Compute B = BlockMix_{salsa20/8, r}(B).  The input B must be 128r bytes in
- * length; the temporary space Y must also be the same size.
+ * blockmix_salsa8(Bin, Bout, X, r):
+ * Compute Bout = BlockMix_{salsa20/8, r}(Bin).  The input Bin must be 128r
+ * bytes in length; the output Bout must also be the same size.  The
+ * temporary space X must be 64 bytes.
  */
 static void
-blockmix_salsa8(uint8_t * B, uint8_t * Y, size_t r)
+blockmix_salsa8(uint32_t * Bin, uint32_t * Bout, uint32_t * X, size_t r)
 {
-	uint8_t X[64];
 	size_t i;
 
 	/* 1: X <-- B_{2r - 1} */
-	blkcpy(X, &B[(2 * r - 1) * 64], 64);
+	blkcpy(X, &Bin[(2 * r - 1) * 16], 64);
 
 	/* 2: for i = 0 to 2r - 1 do */
-	for (i = 0; i < 2 * r; i++) {
+	for (i = 0; i < 2 * r; i += 2) {
 		/* 3: X <-- H(X \xor B_i) */
-		blkxor(X, &B[i * 64], 64);
+		blkxor(X, &Bin[i * 16], 64);
 		salsa20_8(X);
 
 		/* 4: Y_i <-- X */
-		blkcpy(&Y[i * 64], X, 64);
-	}
+		/* 6: B' <-- (Y_0, Y_2 ... Y_{2r-2}, Y_1, Y_3 ... Y_{2r-1}) */
+		blkcpy(&Bout[i * 8], X, 64);
 
-	/* 6: B' <-- (Y_0, Y_2 ... Y_{2r-2}, Y_1, Y_3 ... Y_{2r-1}) */
-	for (i = 0; i < r; i++)
-		blkcpy(&B[i * 64], &Y[(i * 2) * 64], 64);
-	for (i = 0; i < r; i++)
-		blkcpy(&B[(i + r) * 64], &Y[(i * 2 + 1) * 64], 64);
+		/* 3: X <-- H(X \xor B_i) */
+		blkxor(X, &Bin[i * 16 + 16], 64);
+		salsa20_8(X);
+
+		/* 4: Y_i <-- X */
+		/* 6: B' <-- (Y_0, Y_2 ... Y_{2r-2}, Y_1, Y_3 ... Y_{2r-1}) */
+		blkcpy(&Bout[i * 8 + r * 16], X, 64);
+	}
 }
 
 /**
@@ -336,108 +536,96 @@ blockmix_salsa8(uint8_t * B, uint8_t * Y, size_t r)
  * Return the result of parsing B_{2r-1} as a little-endian integer.
  */
 static uint64_t
-integerify(uint8_t * B, size_t r)
+integerify(void * B, size_t r)
 {
-	uint8_t * X = &B[(2 * r - 1) * 64];
+	uint32_t * X = (uint32_t *)((uintptr_t)(B) + (2 * r - 1) * 64);
 
-	return (le64dec(X));
+	return (((uint64_t)(X[1]) << 32) + X[0]);
 }
 
 /**
  * smix(B, r, N, V, XY):
- * Compute B = SMix_r(B, N).  The input B must be 128r bytes in length; the
- * temporary storage V must be 128rN bytes in length; the temporary storage
- * XY must be 256r bytes in length.  The value N must be a power of 2.
+ * Compute B = SMix_r(B, N).  The input B must be 128r bytes in length;
+ * the temporary storage V must be 128rN bytes in length; the temporary
+ * storage XY must be 256r + 64 bytes in length.  The value N must be a
+ * power of 2 greater than 1.  The arrays B, V, and XY must be aligned to a
+ * multiple of 64 bytes.
  */
 static void
-smix(uint8_t * B, size_t r, uint64_t N, uint8_t * V, uint8_t * XY)
+smix(uint8_t * B, size_t r, uint64_t N, uint32_t * V, uint32_t * XY)
 {
-	uint8_t * X = XY;
-	uint8_t * Y = &XY[128 * r];
+	uint32_t * X = XY;
+	uint32_t * Y = &XY[32 * r];
+	uint32_t * Z = &XY[64 * r];
 	uint64_t i;
 	uint64_t j;
+	size_t k;
 
 	/* 1: X <-- B */
-	blkcpy(X, B, 128 * r);
+	for (k = 0; k < 32 * r; k++)
+		X[k] = le32dec(&B[4 * k]);
 
 	/* 2: for i = 0 to N - 1 do */
-	for (i = 0; i < N; i++) {
+	for (i = 0; i < N; i += 2) {
 		/* 3: V_i <-- X */
-		blkcpy(&V[i * (128 * r)], X, 128 * r);
+		blkcpy(&V[i * (32 * r)], X, 128 * r);
 
 		/* 4: X <-- H(X) */
-		blockmix_salsa8(X, Y, r);
+		blockmix_salsa8(X, Y, Z, r);
+
+		/* 3: V_i <-- X */
+		blkcpy(&V[(i + 1) * (32 * r)], Y, 128 * r);
+
+		/* 4: X <-- H(X) */
+		blockmix_salsa8(Y, X, Z, r);
 	}
 
 	/* 6: for i = 0 to N - 1 do */
-	for (i = 0; i < N; i++) {
+	for (i = 0; i < N; i += 2) {
 		/* 7: j <-- Integerify(X) mod N */
 		j = integerify(X, r) & (N - 1);
 
 		/* 8: X <-- H(X \xor V_j) */
-		blkxor(X, &V[j * (128 * r)], 128 * r);
-		blockmix_salsa8(X, Y, r);
+		blkxor(X, &V[j * (32 * r)], 128 * r);
+		blockmix_salsa8(X, Y, Z, r);
+
+		/* 7: j <-- Integerify(X) mod N */
+		j = integerify(Y, r) & (N - 1);
+
+		/* 8: X <-- H(X \xor V_j) */
+		blkxor(Y, &V[j * (32 * r)], 128 * r);
+		blockmix_salsa8(Y, X, Z, r);
 	}
 
 	/* 10: B' <-- X */
-	blkcpy(B, X, 128 * r);
+	for (k = 0; k < 32 * r; k++)
+		le32enc(&B[4 * k], X[k]);
 }
 
-/**
- * crypto_scrypt(passwd, passwdlen, salt, saltlen, N, r, p, buf, buflen):
- * Compute scrypt(passwd[0 .. passwdlen - 1], salt[0 .. saltlen - 1], N, r,
- * p, buflen) and write the result into buf.  The parameters r, p, and buflen
- * must satisfy r * p < 2^30 and buflen <= (2^32 - 1) * 32.  The parameter N
- * must be a power of 2.
- *
- * Return 0 on success; or -1 on error.
- */
+#endif
 
-int
-crypto_scrypt(const uint8_t * passwd, size_t passwdlen,
-    const uint8_t * salt, size_t saltlen, uint64_t N, uint32_t _r, uint32_t _p,
-    uint8_t * buf, size_t buflen)
+
+
+/* cpu and memory intensive function to transform a 80 byte buffer into a 32 byte output
+   scratchpad size needs to be at least 63 + (128 * r * p) + (256 * r + 64) + (128 * r * N) bytes
+ */
+void scrypt_core(const char* input, char* output, char* scratchpad, uint32_t len)
 {
 	uint8_t * B;
-	uint8_t * V;
-	uint8_t * XY;
-	size_t r = _r, p = _p;
+	uint32_t * V;
+	uint32_t * XY;
 	uint32_t i;
 
-	/* Sanity-check parameters. */
-#if SIZE_MAX > UINT32_MAX
-	if (buflen > (((uint64_t)(1) << 32) - 1) * 32) {
-		//errno = EFBIG;
-		goto err0;
-	}
-#endif
-	if ((uint64_t)(r) * (uint64_t)(p) >= (1 << 30)) {
-		//errno = EFBIG;
-		goto err0;
-	}
-	if (((N & (N - 1)) != 0) || (N == 0)) {
-		//errno = EINVAL;
-		goto err0;
-	}
-	if ((r > SIZE_MAX / 128 / p) ||
-#if SIZE_MAX / 256 <= UINT32_MAX
-	    (r > SIZE_MAX / 256) ||
-#endif
-	    (N > SIZE_MAX / 128 / r)) {
-		//errno = ENOMEM;
-		goto err0;
-	}
+	const uint32_t N = 8;
+	const uint32_t r = 4;
+	const uint32_t p = 1;
 
-	/* Allocate memory. */
-	if ((B = (uint8_t*)malloc(128 * r * p)) == NULL)
-		goto err0;
-	if ((XY = (uint8_t*)malloc(256 * r)) == NULL)
-		goto err1;
-	if ((V = (uint8_t*)malloc(128 * r * N)) == NULL)
-		goto err2;
+	B = (uint8_t *)(((uintptr_t)(scratchpad) + 63) & ~ (uintptr_t)(63));
+	XY = (uint32_t *)(B + (128 * r * p));
+	V = (uint32_t *)(B + (128 * r * p) + (256 * r + 64));
 
 	/* 1: (B_0 ... B_{p-1}) <-- PBKDF2(P, S, 1, p * MFLen) */
-	PBKDF2_SHA256(passwd, passwdlen, salt, saltlen, 1, B, p * 128 * r);
+	PBKDF2_SHA256((const uint8_t*)input, len, (const uint8_t*)input, len, 1, B, p * 128 * r);
 
 	/* 2: for i = 0 to p - 1 do */
 	for (i = 0; i < p; i++) {
@@ -446,70 +634,14 @@ crypto_scrypt(const uint8_t * passwd, size_t passwdlen,
 	}
 
 	/* 5: DK <-- PBKDF2(P, B, 1, dkLen) */
-	PBKDF2_SHA256(passwd, passwdlen, B, p * 128 * r, 1, buf, buflen);
-
-	/* Free memory. */
-	free(V);
-	free(XY);
-	free(B);
-
-	/* Success! */
-	return (0);
-
-err2:
-	free(XY);
-err1:
-	free(B);
-err0:
-	/* Failure! */
-	return (-1);
-}
-
-void scrypt_1024_1_1_256(const char *input, char *output, char *scratchpad)
-{
-	const int N=8;
-	const int R=4;
-	const int P=1;
-	crypto_scrypt((uint8_t*)input, 80, (uint8_t*)input, 80, N, R, P, (uint8_t*)output, (256/8)); 
-}
-/*
-void scrypt_core(const char* input, char* output, char* scratchpad, uint32_t len)
-{
-	uint8_t * B;
-	uint8_t * V;
-	uint8_t * XY;
-	uint32_t i;
-
-	const uint32_t N = 1024;
-	const uint32_t r = 1;
-	const uint32_t p = 1;
-
-	B = (uint8_t *)(((uintptr_t)(scratchpad) + 63) & ~ (uintptr_t)(63));
-	XY = (uint8_t *)(B + (128 * r * p));
-	V = (uint8_t *)(B + (128 * r * p) + (256 * r + 64));
-
-	/* 1: (B_0 ... B_{p-1}) <-- PBKDF2(P, S, 1, p * MFLen) *
-	PBKDF2_SHA256((const uint8_t*)input, len, (const uint8_t*)input, len, 1, B, p * 128 * r);
-
-	/* 2: for i = 0 to p - 1 do *
-	for (i = 0; i < p; i++) {
-		/* 3: B_i <-- MF(B_i, N) *
-		smix(&B[i * 128 * r], r, N, V, XY);
-	}
-
-	/* 5: DK <-- PBKDF2(P, B, 1, dkLen) *
 	PBKDF2_SHA256((const uint8_t*)input, len, B, p * 128 * r, 1, (uint8_t*)output, 32);
 }
 
 
 void scrypt_1024_1_1_256(const char *input, char *output, char *scratchpad)
 {
-	const int N=256;
-	const int R=8;
-	const int P=1;
-	scrypt_core((uint8_t*)input, (uint8_t*)output, scratchpad, 80); 
+	scrypt_core(input, output, scratchpad, 80);  //80 for length as that is the block header size
 }
-*/
 #define SCRYPT_MAX_WAYS 1
 #define scrypt_best_throughput() 1
 
@@ -534,25 +666,7 @@ int scanhash_scrypt(int thr_id, uint32_t *pdata,
 	do {
 		for (i = 0; i < throughput; i++)
 			data[i * 20 + 19] = ++n;
-		//uint8_t d2[80]={0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x87, 0x0, 0xe3, 0x6, 0x38, 0xf3, 0xb9, 0xbd, 0x20, 0xb4, 0xa5, 0x4, 0x83, 0x3c, 0xdc, 0x1b, 0x9a, 0xf5, 0x13, 0x29, 0x62, 0xa1, 0x57, 0xc2, 0x0, 0x5, 0x76, 0xd0, 0x70, 0x8b, 0x3e, 0x5, 0xfb, 0x13, 0x53, 0x53, 0xf0, 0xff, 0xf, 0x1e, 0x69, 0xfd, 0x3f, 0x0};
-		/*
-		uint8_t* h2=(uint8_t*)data;
-		printf("input: \n");
-		for(int i=0;i<80;i++)
-		{
-			printf("0x%x,",h2[i]);
-		}
-		printf("\n"); */
 		scrypt_1024_1_1_256((char*)data, (char*)hash, (char*)scratchbuf);
-		/*
-		printf("hash: \n");
-		h2=(uint8_t*)hash;
-		for(int i=0;i<32;i++)
-		{
-			printf("0x%x,",h2[i]);
-		}
-		printf("\n");
-		exit(1); */
 		for (i = 0; i < throughput; i++) {
 			if (hash[i * 8 + 7] <= Htarg && fulltest(hash + i*8, ptarget)) {
 
