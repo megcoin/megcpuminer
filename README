@@ -1,6 +1,7 @@
 This is a multi-threaded CPU miner for megcoin using scrypt-123,
 fork of pooler's cpuminer.
 
+**NOTE** to compile this megcoin fork, you must modify Makefile after `./configure` to add `-lcrypto` to the linked in libraries (after -lpthread) and have OpenSSL libraries installed 
 
 License: GPLv2.  See COPYING for details.
 
